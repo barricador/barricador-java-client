@@ -5,6 +5,7 @@ import com.barricador.client.internal.EvaluationResult;
 import com.barricador.client.internal.FlagStore;
 import com.barricador.client.internal.HttpTransport;
 import com.barricador.client.internal.MetricsBuffer;
+import com.barricador.client.internal.PollSynchronizer;
 import com.barricador.client.internal.StreamSynchronizer;
 import com.barricador.client.model.FlagModels.BootstrapResponse;
 import com.barricador.client.model.FlagModels.FeatureFlag;
@@ -28,9 +29,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <h2>Zero-impact guarantee</h2>
  * Evaluation ({@link #isEnabled}, {@link #stringVariation}, …) is a synchronous in-memory lookup and
- * never performs network I/O. State is populated by an async bootstrap and kept fresh by a background
- * SSE stream; telemetry is aggregated in memory and flushed by a background worker. Any backend
+ * never performs network I/O. State is populated by an async bootstrap and kept fresh in the
+ * background; telemetry is aggregated in memory and flushed by a background worker. Any backend
  * outage degrades gracefully to the last cached ruleset, then to the caller-supplied default.
+ *
+ * <h2>Synchronization mode</h2>
+ * By default the ruleset is refreshed by conditional polling every
+ * {@link BarricadorConfig#pollInterval()} (30s), so an unchanged ruleset costs one 304. Call
+ * {@code streamingEnabled(true)} for near-instant propagation via SSE — that holds a connection
+ * open, which is billed as continuous backend instance time, so it is opt-in.
  */
 public final class BarricadorClient implements AutoCloseable {
 
@@ -43,6 +50,7 @@ public final class BarricadorClient implements AutoCloseable {
     private final ObjectMapper mapper = new ObjectMapper();
     private final HttpTransport transport;
     private final StreamSynchronizer synchronizer;
+    private final PollSynchronizer poller;
     private final ScheduledExecutorService scheduler;
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
@@ -53,6 +61,7 @@ public final class BarricadorClient implements AutoCloseable {
                 .build();
         this.transport = new HttpTransport(config, mapper, httpClient);
         this.synchronizer = new StreamSynchronizer(transport, store, mapper, this::safeBootstrap);
+        this.poller = new PollSynchronizer(transport, store, config.pollInterval());
         this.scheduler = Executors.newScheduledThreadPool(1, daemonFactory());
         start();
     }
@@ -71,6 +80,8 @@ public final class BarricadorClient implements AutoCloseable {
         safeBootstrap();
         if (config.streamingEnabled()) {
             synchronizer.start();
+        } else {
+            poller.start();
         }
         if (config.metricsEnabled()) {
             long ms = config.metricsFlushInterval().toMillis();
@@ -128,12 +139,15 @@ public final class BarricadorClient implements AutoCloseable {
 
     private void safeBootstrap() {
         try {
-            BootstrapResponse resp = transport.bootstrap();
+            HttpTransport.BootstrapResult result = transport.bootstrap(null);
+            BootstrapResponse resp = result.body();
             Map<String, FeatureFlag> map = new HashMap<>();
             if (resp.flags != null) {
                 resp.flags.forEach(f -> map.put(f.key, f));
             }
             store.replaceAll(map, resp.rulesVersion);
+            // Seed the poll validator so the very first poll can short-circuit to 304.
+            poller.seedEtag(result.etag());
             log.debug("Barricador bootstrap complete: {} flags (v{})", map.size(), resp.rulesVersion);
         } catch (Exception e) {
             // Never fatal: keep serving cached state (or defaults if first bootstrap failed).
@@ -162,6 +176,7 @@ public final class BarricadorClient implements AutoCloseable {
     public void close() {
         if (closed.compareAndSet(false, true)) {
             synchronizer.stop();
+            poller.stop();
             safeFlush();
             scheduler.shutdown();
             try {

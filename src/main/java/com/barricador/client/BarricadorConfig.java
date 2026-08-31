@@ -15,6 +15,7 @@ public final class BarricadorConfig {
     private final Duration initialReconnectDelay;
     private final Duration maxReconnectDelay;
     private final boolean streamingEnabled;
+    private final Duration pollInterval;
     private final boolean metricsEnabled;
     private final Duration startupBootstrapTimeout;
 
@@ -26,6 +27,7 @@ public final class BarricadorConfig {
         this.initialReconnectDelay = b.initialReconnectDelay;
         this.maxReconnectDelay = b.maxReconnectDelay;
         this.streamingEnabled = b.streamingEnabled;
+        this.pollInterval = b.pollInterval;
         this.metricsEnabled = b.metricsEnabled;
         this.startupBootstrapTimeout = b.startupBootstrapTimeout;
     }
@@ -58,6 +60,11 @@ public final class BarricadorConfig {
         return streamingEnabled;
     }
 
+    /** How often the SDK re-checks the ruleset when streaming is disabled (the default mode). */
+    public Duration pollInterval() {
+        return pollInterval;
+    }
+
     public boolean metricsEnabled() {
         return metricsEnabled;
     }
@@ -73,7 +80,12 @@ public final class BarricadorConfig {
         private Duration metricsFlushInterval = Duration.ofSeconds(30);
         private Duration initialReconnectDelay = Duration.ofSeconds(1);
         private Duration maxReconnectDelay = Duration.ofSeconds(60);
-        private boolean streamingEnabled = true;
+        // Polling is the default. An open SSE stream bills backend instance time for its entire
+        // lifetime, so streaming every SDK by default made an idle service cost the same as a busy
+        // one. Polling costs a 304 every pollInterval; opt back in when sub-second propagation
+        // matters more than cost.
+        private boolean streamingEnabled = false;
+        private Duration pollInterval = Duration.ofSeconds(30);
         private boolean metricsEnabled = true;
         private Duration startupBootstrapTimeout = Duration.ofSeconds(5);
 
@@ -109,8 +121,27 @@ public final class BarricadorConfig {
             return this;
         }
 
+        /**
+         * Opt into Server-Sent Events for near-instant flag propagation. Off by default: a held-open
+         * stream is billed as continuous backend instance time, while polling is not. Turn this on
+         * for kill-switch flags where a delay of up to {@link #pollInterval(Duration)} is not
+         * acceptable.
+         */
         public Builder streamingEnabled(boolean enabled) {
             this.streamingEnabled = enabled;
+            return this;
+        }
+
+        /**
+         * Interval between ruleset refreshes when streaming is disabled. Default 30s. Unchanged
+         * rulesets return {@code 304 Not Modified}, so a short interval is cheap — but it is still a
+         * request per interval per process.
+         */
+        public Builder pollInterval(Duration d) {
+            if (d == null || d.isNegative() || d.isZero()) {
+                throw new IllegalArgumentException("pollInterval must be positive");
+            }
+            this.pollInterval = d;
             return this;
         }
 
